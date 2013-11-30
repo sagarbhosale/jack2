@@ -53,6 +53,7 @@ def configure(conf):
     conf.env['BUILD_EXAMPLE_CLIENT_TRANSPORT'] = bool(conf.env['LIB_READLINE'])
 
     conf.env['BUILD_EXAMPLE_CLIENT_REC'] = conf.is_defined('HAVE_SNDFILE')
+    conf.env['BUILD_EXAMPLE_CLIENT_MULTI_REC'] = conf.is_defined('HAVE_SNDFILE')
 
     conf.env['BUILD_EXAMPLE_ALSA_IO'] = conf.is_defined('HAVE_SAMPLERATE') and conf.env['BUILD_DRIVER_ALSA']
 
@@ -123,9 +124,29 @@ def build(bld):
             prog.use += ['RT', 'SNDFILE']
         if bld.env['IS_SUN']:
             prog.use += ['RT', 'SNDFILE']
-	if bld.env['IS_WINDOWS']:
+        if bld.env['IS_WINDOWS']:
             prog.uselib = ['SNDFILE']
         prog.target = 'jack_rec'
+
+    if bld.env['BUILD_EXAMPLE_CLIENT_MULTI_REC']:
+    	prog = bld(features = 'c cprogram')
+        prog.includes = os_incdir + ['../common/jack', '../common']
+	prog.source = 'capture_client_multi_track.c'
+	prog.use = ['clientlib']
+	if bld.env['IS_MACOSX']:
+	    prog.env.append_value("CPPFLAGS", "-mmacosx-version-min=10.4 -arch i386 -arch ppc -arch x86_64")
+	    #prog.env.append_value("LINKFLAGS", "-arch i386 -arch ppc -arch x86_64")
+	    prog.env.append_value("LINKFLAGS", "")
+	    prog.use += ['SNDFILE']
+	if bld.env['IS_LINUX']:
+	    prog.use += ['RT', 'SNDFILE']
+	if bld.env['IS_SUN']:
+	    prog.use += ['RT', 'SNDFILE']
+	if bld.env['IS_WINDOWS']:
+	    prog.uselib = ['SNDFILE']
+	prog.target = 'jack_multi_rec'
+
+
 
     if bld.env['IS_LINUX'] or bld.env['IS_MACOSX']:
         prog = bld(features = 'c cprogram')

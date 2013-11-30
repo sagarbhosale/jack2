@@ -30,19 +30,20 @@
 #include <signal.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <limits.h>
 
 #include <jack/jack.h>
 #include <jack/ringbuffer.h>
 
 typedef struct _thread_info {
     pthread_t thread_id;
-    SNDFILE *sf;
+    SNDFILE *sf[64];
     jack_nframes_t duration;
     jack_nframes_t rb_size;
     jack_client_t *client;
     unsigned int channels;
     int bitdepth;
-    char *path;
+    char *path[64];
     volatile int can_capture;
     volatile int can_process;
     volatile int status;
@@ -56,7 +57,7 @@ jack_nframes_t nframes;
 const size_t sample_size = sizeof(jack_default_audio_sample_t);
 
 /* Synchronization between process thread and disk thread. */
-#define DEFAULT_RB_SIZE 16384		/* ringbuffer size in frames */
+#define DEFAULT_RB_SIZE 163840		/* ringbuffer size in frames */
 jack_ringbuffer_t *rb;
 pthread_mutex_t disk_thread_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t  data_ready = PTHREAD_COND_INITIALIZER;
@@ -77,12 +78,14 @@ disk_thread (void *arg)
 	static jack_nframes_t total_captured = 0;
 	jack_nframes_t samples_per_frame = info->channels;
 	size_t bytes_per_frame = samples_per_frame * sample_size;
-	void *framebuf = malloc (bytes_per_frame);
+	void *onesample = malloc (sample_size);
 
 	pthread_setcanceltype (PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
 	pthread_mutex_lock (&disk_thread_lock);
 
 	info->status = 0;
+
+	int xi=0;
 
 	while (1) {
 
@@ -91,20 +94,22 @@ disk_thread (void *arg)
 		while (info->can_capture &&
 		       (jack_ringbuffer_read_space (rb) >= bytes_per_frame)) {
 
-			jack_ringbuffer_read (rb, framebuf, bytes_per_frame);
+			for(xi=0; xi<samples_per_frame; xi++)
+			{
+				jack_ringbuffer_read (rb, onesample, sample_size);
 
-			if (sf_writef_float (info->sf, framebuf, 1) != 1) {
-				char errstr[256];
-				sf_error_str (0, errstr, sizeof (errstr) - 1);
-				fprintf (stderr,
-					 "cannot write sndfile (%s)\n",
-					 errstr);
-				info->status = EIO; /* write failed */
-				goto done;
+				if (sf_writef_float (info->sf[xi], onesample, 1) != 1) {
+					char errstr[256];
+					sf_error_str (0, errstr, sizeof (errstr) - 1);
+					fprintf (stderr,
+						 "cannot write sndfile (%s)\n",
+						 errstr);
+					info->status = EIO; /* write failed */
+					goto done;
+				}
 			}
-
 			if (++total_captured >= info->duration) {
-				printf ("disk thread finished\n");
+				printf ("All files saved successfully\n");
 				goto done;
 			}
 		}
@@ -115,7 +120,7 @@ disk_thread (void *arg)
 
  done:
 	pthread_mutex_unlock (&disk_thread_lock);
-	free (framebuf);
+	free (onesample);
 	return 0;
 }
 
@@ -135,12 +140,17 @@ process (jack_nframes_t nframes, void *arg)
 
 	/* Sndfile requires interleaved data.  It is simpler here to
 	 * just queue interleaved samples to a single ringbuffer. */
+
+	int tmp=0;
+
 	for (i = 0; i < nframes; i++) {
 		for (chn = 0; chn < nports; chn++) {
-			if (jack_ringbuffer_write (rb, (void *) (in[chn]+i),
-					      sample_size)
+			if ((tmp = jack_ringbuffer_write (rb, (void *) (in[chn]+i),
+					      sample_size))
 			    < sample_size)
+			{
 				overruns++;
+			}
 		}
 	}
 
@@ -186,13 +196,17 @@ setup_disk_thread (jack_thread_info_t *info)
 			 break;
 	}
 	sf_info.format = SF_FORMAT_WAV|short_mask;
-
-	if ((info->sf = sf_open (info->path, SFM_WRITE, &sf_info)) == NULL) {
-		char errstr[256];
-		sf_error_str (0, errstr, sizeof (errstr) - 1);
-		fprintf (stderr, "cannot open sndfile \"%s\" for output (%s)\n", info->path, errstr);
-		jack_client_close (info->client);
-		exit (1);
+	
+	int xi=0;
+	for(xi=0; xi<info->channels; xi++)
+	{
+		if ((info->sf[xi] = sf_open (info->path[xi], SFM_WRITE, &sf_info)) == NULL) {
+			char errstr[256];
+			sf_error_str (0, errstr, sizeof (errstr) - 1);
+			fprintf (stderr, "cannot open sndfile \"%s\" for output (%s)\n", info->path[xi], errstr);
+			jack_client_close (info->client);
+			exit (1);
+		}
 	}
 
 	info->duration *= sf_info.samplerate;
@@ -206,10 +220,12 @@ run_disk_thread (jack_thread_info_t *info)
 {
 	info->can_capture = 1;
 	pthread_join (info->thread_id, NULL);
-	sf_close (info->sf);
+	int xi=0;
+	for(xi=0; xi<info->channels; xi++)
+		sf_close (info->sf[xi]);
 	if (overruns > 0) {
 		fprintf (stderr,
-			 "jackrec failed with %ld overruns.\n", overruns);
+			 "jack_multi_rec failed with %ld overruns.\n", overruns);
 		fprintf (stderr, " try a bigger buffer than -B %"
 			 PRIu32 ".\n", info->rb_size);
 		info->status = EPIPE;
@@ -268,6 +284,7 @@ main (int argc, char *argv[])
 	int longopt_index = 0;
 	extern int optind, opterr;
 	int show_usage = 0;
+	char *dirpath;
 	char *optstring = "d:f:b:B:h";
 	struct option long_options[] = {
 		{ "help", 0, 0, 'h' },
@@ -295,7 +312,7 @@ main (int argc, char *argv[])
 			thread_info.duration = atoi (optarg);
 			break;
 		case 'f':
-			thread_info.path = optarg;
+			dirpath = optarg;
 			break;
 		case 'b':
 			thread_info.bitdepth = atoi (optarg);
@@ -310,8 +327,8 @@ main (int argc, char *argv[])
 		}
 	}
 
-	if (show_usage || thread_info.path == NULL || optind == argc) {
-		fprintf (stderr, "usage: jackrec -f filename [ -d second ] [ -b bitdepth ] [ -B bufsize ] port1 [ port2 ... ]\n");
+	if (show_usage || 0 == strlen(dirpath) || optind == argc) {
+		fprintf (stderr, "usage: jack_multi_rec -f outdir [ -d second ] [ -b bitdepth ] [ -B bufsize ] port1 [ port2 ... ]\n");
 		exit (1);
 	}
 
@@ -323,6 +340,13 @@ main (int argc, char *argv[])
 	thread_info.client = client;
 	thread_info.channels = argc - optind;
 	thread_info.can_process = 0;
+
+	int xi=0;
+	for(xi=0; xi<thread_info.channels; xi++)
+	{
+		thread_info.path[xi] = malloc(14);
+		sprintf(thread_info.path[xi], "%s/ch_%02d.wav", dirpath, xi + 1);
+	}
 
 	setup_disk_thread (&thread_info);
 
@@ -348,6 +372,9 @@ main (int argc, char *argv[])
 	jack_client_close (client);
 
 	jack_ringbuffer_free (rb);
+
+	for(xi=0; xi<thread_info.channels; xi++)
+		free(thread_info.path[xi]);
 
 	exit (0);
 }
